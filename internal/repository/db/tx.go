@@ -60,10 +60,16 @@ func updateTaskStatusTx(ctx context.Context, tx *sql.Tx, taskID uuid.UUID, statu
 
 // --- Встречи ---
 
-// CreateMeetingWithTask создаёт встречу, задачу (status=created) и первое событие
-// в одной транзакции: если любой шаг падает, вся встреча откатывается.
-func (r *Repository) CreateMeetingWithTask(ctx context.Context, userID uuid.UUID, title, filePath string, fileSize int64, mimeType string) (models.Meeting, error) {
+// CreateMeetingWithTask создаёт встречу, задачу (status=created), первое событие
+// и входные данные встречи (text/audio) в одной транзакции: если любой шаг падает,
+func (r *Repository) CreateMeetingWithTask(ctx context.Context, userID uuid.UUID, title, filePath string, fileSize int64, mimeType, text string, audio []byte) (models.Meeting, error) {
 	var meeting models.Meeting
+
+	// Определяем тип входных данных: текст или аудио.
+	inputType := "audio"
+	if text != "" {
+		inputType = "text"
+	}
 
 	err := withTx(ctx, r.db, func(tx *sql.Tx) error {
 		const insertMeeting = `
@@ -105,6 +111,14 @@ func (r *Repository) CreateMeetingWithTask(ctx context.Context, userID uuid.UUID
 		// Первое событие в истории задачи.
 		if err := updateTaskStatusTx(ctx, tx, parsedTaskID, models.StatusCreated, "meeting created"); err != nil {
 			return err
+		}
+
+		// Входные данные встречи: текст или аудио.
+		const insertInput = `
+			INSERT INTO meeting_inputs (meeting_id, input_type, text, audio_data)
+			VALUES ($1, $2, $3, $4)`
+		if _, err := tx.ExecContext(ctx, insertInput, meeting.ID, inputType, text, audio); err != nil {
+			return fmt.Errorf("insert meeting input: %w", err)
 		}
 		return nil
 	})

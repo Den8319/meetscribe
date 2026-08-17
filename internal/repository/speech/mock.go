@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"time"
+
+	"github.com/Den8319/meetscribe/internal/repository/opt"
 )
 
 // mockScenarios содержит 4 предзаписанных стенограммы для имитации распознавания.
@@ -49,16 +51,22 @@ type MockClient struct {
 }
 
 // NewMock создаёт mock-клиент (generic option pattern).
-// По умолчанию задержка 2-5 секунд; настраивается опцией WithDelay.
-func NewMock(opts ...Option[MockClient]) *MockClient {
+// По умолчанию задержка 2-5 секунд; настраивается опцией opt.WithDelay.
+func NewMock(opts ...opt.Option[MockClient]) *MockClient {
 	m := &MockClient{
 		delayMin: 2 * time.Second,
 		delayMax: 5 * time.Second,
 	}
-	for _, opt := range opts {
-		opt(m)
+	for _, o := range opts {
+		o(m)
 	}
 	return m
+}
+
+// SetDelay реализует opt.Delayer.
+func (m *MockClient) SetDelay(min, max time.Duration) {
+	m.delayMin = min
+	m.delayMax = max
 }
 
 // Transcribe имитирует распознавание речи: выбирает сценарий по хэшу аудио,
@@ -75,7 +83,7 @@ func (m *MockClient) Transcribe(ctx context.Context, audio []byte, mimeType stri
 	delay := m.delayMin
 	if m.delayMax > m.delayMin {
 		spread := m.delayMax - m.delayMin
-		
+
 		offset := time.Duration(binary.BigEndian.Uint32(hash[4:8])%uint32(spread)) % spread
 		delay = m.delayMin + offset
 	}

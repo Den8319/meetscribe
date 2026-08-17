@@ -46,6 +46,8 @@ func (s *MeetingService) RegisterUser(ctx context.Context, externalID int64, use
 }
 
 // UploadAndStartProcessing создаёт встречу и задачу на обработку.
+// Входные данные (текст или аудио) сохраняются в БД вместе со встречей —
+// воркер читает их оттуда, что гарантирует восстановление после рестарта.
 func (s *MeetingService) UploadAndStartProcessing(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -54,7 +56,7 @@ func (s *MeetingService) UploadAndStartProcessing(
 	mimeType string,
 	text string,
 ) (models.Meeting, error) {
-	meeting, err := s.storage.CreateMeetingWithTask(ctx, userID, title, "", int64(len(audio)), mimeType)
+	meeting, err := s.storage.CreateMeetingWithTask(ctx, userID, title, "", int64(len(audio)), mimeType, text, audio)
 	if err != nil {
 		slog.Error("meeting creation failed", "user_id", userID, "title", title, "error", err)
 		return models.Meeting{}, fmt.Errorf("create meeting: %w", err)

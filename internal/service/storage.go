@@ -17,8 +17,9 @@ type Storage interface {
 	GetUserByExternalID(ctx context.Context, externalID int64) (models.User, error)
 
 	//Встречи
-	CreateMeetingWithTask(ctx context.Context, userID uuid.UUID, title, filePath string, fileSize int64, mimeType string) (models.Meeting, error)
+	CreateMeetingWithTask(ctx context.Context, userID uuid.UUID, title, filePath string, fileSize int64, mimeType, text string, audio []byte) (models.Meeting, error)
 	GetMeetingByID(ctx context.Context, userID, meetingID uuid.UUID) (models.Meeting, error)
+	GetMeetingInput(ctx context.Context, meetingID uuid.UUID) (models.MeetingInput, error)
 	ListMeetingsByUser(ctx context.Context, userID uuid.UUID) ([]models.Meeting, error)
 	ListMeetingsDetailed(ctx context.Context, userID uuid.UUID) ([]models.MeetingListItem, error)
 

@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	_ "github.com/jackc/pgx/v5/stdlib" 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 
 	"github.com/Den8319/meetscribe/internal/models"
@@ -70,18 +70,7 @@ func (r *Repository) CreateUser(ctx context.Context, externalID int64, username 
 		ON CONFLICT (external_id) DO UPDATE SET username = EXCLUDED.username
 		RETURNING id, external_id, username, created_at`
 
-	var u models.User
-	var id string
-	err := r.db.QueryRowContext(ctx, q, externalID, username).
-		Scan(&id, &u.ExternalID, &u.Username, &u.CreatedAt)
-	if err != nil {
-		return models.User{}, fmt.Errorf("create user: %w", err)
-	}
-	u.ID, err = uuid.Parse(id)
-	if err != nil {
-		return models.User{}, fmt.Errorf("parse user id: %w", err)
-	}
-	return u, nil
+	return scanUser(r.db.QueryRowContext(ctx, q, externalID, username))
 }
 
 // GetUserByExternalID возвращает пользователя по внешнему идентификатору.
@@ -106,6 +95,17 @@ func (r *Repository) GetMeetingByID(ctx context.Context, userID, meetingID uuid.
 	return scanMeeting(r.db.QueryRowContext(ctx, q, meetingID, userID))
 }
 
+// GetMeetingInput возвращает входные данные встречи (текст/аудио) из БД.
+func (r *Repository) GetMeetingInput(ctx context.Context, meetingID uuid.UUID) (models.MeetingInput, error) {
+	const q = `
+		SELECT mi.meeting_id, mi.input_type, mi.text, mi.audio_data, m.mime_type
+		FROM meeting_inputs mi
+		JOIN meetings m ON m.id = mi.meeting_id
+		WHERE mi.meeting_id = $1`
+
+	return scanMeetingInput(r.db.QueryRowContext(ctx, q, meetingID))
+}
+
 // ListMeetingsByUser возвращает все встречи пользователя, новые — первыми.
 func (r *Repository) ListMeetingsByUser(ctx context.Context, userID uuid.UUID) ([]models.Meeting, error) {
 	const q = `
@@ -118,17 +118,8 @@ func (r *Repository) ListMeetingsByUser(ctx context.Context, userID uuid.UUID) (
 	if err != nil {
 		return nil, fmt.Errorf("list meetings: %w", err)
 	}
-	defer rows.Close()
 
-	var meetings []models.Meeting
-	for rows.Next() {
-		m, err := scanMeeting(rows)
-		if err != nil {
-			return nil, err
-		}
-		meetings = append(meetings, m)
-	}
-	return meetings, rows.Err()
+	return scanRows(rows, scanMeeting)
 }
 
 // ListMeetingsDetailed возвращает встречи пользователя с статусом и выжимкой.
@@ -147,17 +138,8 @@ func (r *Repository) ListMeetingsDetailed(ctx context.Context, userID uuid.UUID)
 	if err != nil {
 		return nil, fmt.Errorf("list meetings detailed: %w", err)
 	}
-	defer rows.Close()
 
-	var items []models.MeetingListItem
-	for rows.Next() {
-		var item models.MeetingListItem
-		if err := rows.Scan(&item.MeetingID, &item.Title, &item.CreatedAt, &item.Status, &item.Summary); err != nil {
-			return nil, fmt.Errorf("scan meeting item: %w", err)
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	return scanRows(rows, scanMeetingListItem)
 }
 
 // --- Задачи ---
@@ -194,17 +176,8 @@ func (r *Repository) GetTasksByStatus(ctx context.Context, statuses ...models.Ta
 	if err != nil {
 		return nil, fmt.Errorf("get tasks by status: %w", err)
 	}
-	defer rows.Close()
 
-	var tasks []models.Task
-	for rows.Next() {
-		t, err := scanTask(rows)
-		if err != nil {
-			return nil, err
-		}
-		tasks = append(tasks, t)
-	}
-	return tasks, rows.Err()
+	return scanRows(rows, scanTask)
 }
 
 // --- Транскрипции и выжимки ---
@@ -217,21 +190,7 @@ func (r *Repository) GetTranscript(ctx context.Context, userID, meetingID uuid.U
 		JOIN meetings m ON m.id = tr.meeting_id
 		WHERE tr.meeting_id = $1 AND m.user_id = $2`
 
-	var t models.Transcript
-	var id string
-	err := r.db.QueryRowContext(ctx, q, meetingID, userID).
-		Scan(&id, &t.MeetingID, &t.Text, &t.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return models.Transcript{}, models.ErrNotFound
-	}
-	if err != nil {
-		return models.Transcript{}, fmt.Errorf("get transcript: %w", err)
-	}
-	t.ID, err = uuid.Parse(id)
-	if err != nil {
-		return models.Transcript{}, fmt.Errorf("parse transcript id: %w", err)
-	}
-	return t, nil
+	return scanTranscript(r.db.QueryRowContext(ctx, q, meetingID, userID))
 }
 
 // GetSummary возвращает выжимку встречи с проверкой прав владельца.
@@ -242,21 +201,7 @@ func (r *Repository) GetSummary(ctx context.Context, userID, meetingID uuid.UUID
 		JOIN meetings m ON m.id = s.meeting_id
 		WHERE s.meeting_id = $1 AND m.user_id = $2`
 
-	var s models.Summary
-	var id string
-	err := r.db.QueryRowContext(ctx, q, meetingID, userID).
-		Scan(&id, &s.MeetingID, &s.Text, &s.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return models.Summary{}, models.ErrNotFound
-	}
-	if err != nil {
-		return models.Summary{}, fmt.Errorf("get summary: %w", err)
-	}
-	s.ID, err = uuid.Parse(id)
-	if err != nil {
-		return models.Summary{}, fmt.Errorf("parse summary id: %w", err)
-	}
-	return s, nil
+	return scanSummary(r.db.QueryRowContext(ctx, q, meetingID, userID))
 }
 
 // --- Поиск---
@@ -282,22 +227,8 @@ func (r *Repository) SearchMeetings(ctx context.Context, userID uuid.UUID, query
 	if err != nil {
 		return nil, fmt.Errorf("search meetings: %w", err)
 	}
-	defer rows.Close()
 
-	var results []models.SearchResult
-	for rows.Next() {
-		var res models.SearchResult
-		var id string
-		if err := rows.Scan(&id, &res.CreatedAt, &res.Status, &res.Snippet); err != nil {
-			return nil, fmt.Errorf("scan search result: %w", err)
-		}
-		res.MeetingID, err = uuid.Parse(id)
-		if err != nil {
-			return nil, fmt.Errorf("parse meeting id: %w", err)
-		}
-		results = append(results, res)
-	}
-	return results, rows.Err()
+	return scanRows(rows, scanSearchResult)
 }
 
 // --- Чат ---
@@ -328,94 +259,179 @@ func (r *Repository) ListChatHistory(ctx context.Context, userID, meetingID uuid
 	if err != nil {
 		return nil, fmt.Errorf("list chat history: %w", err)
 	}
-	defer rows.Close()
 
-	var messages []models.ChatMessage
-	for rows.Next() {
-		var msg models.ChatMessage
-		var id, meetingIDStr, userIDStr string
-		if err := rows.Scan(&id, &meetingIDStr, &userIDStr, &msg.Role, &msg.Message, &msg.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan chat message: %w", err)
-		}
-		msg.ID, err = uuid.Parse(id)
-		if err != nil {
-			return nil, fmt.Errorf("parse message id: %w", err)
-		}
-		msg.MeetingID, err = uuid.Parse(meetingIDStr)
-		if err != nil {
-			return nil, fmt.Errorf("parse meeting id: %w", err)
-		}
-		msg.UserID, err = uuid.Parse(userIDStr)
-		if err != nil {
-			return nil, fmt.Errorf("parse user id: %w", err)
-		}
-		messages = append(messages, msg)
-	}
-	return messages, rows.Err()
+	return scanRows(rows, scanChatMessage)
 }
 
-// --- Сканеры строк ---
+// --- Generic-хелперы для сканирования строк ---
 
 type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanUser(row rowScanner) (models.User, error) {
-	var u models.User
-	var id string
-	err := row.Scan(&id, &u.ExternalID, &u.Username, &u.CreatedAt)
+// uuidBinder связывает строковую переменную из sql.Scan с целевым полем uuid.UUID.
+// Register создаёт промежуточную *string для Scan и запоминает связь.
+// parseAndBind парсит все зарегистрированные строки и раскладывает по местам.
+type uuidBinder struct {
+	bindings []uuidBinding
+}
+
+type uuidBinding struct {
+	src  *string
+	dest *uuid.UUID
+}
+
+// Register создаёт связь между колонкой БД (строка) и полем структуры (uuid.UUID).
+// Возвращает *string для передачи в row.Scan.
+func (b *uuidBinder) Register(dest *uuid.UUID) *string {
+	var v string
+	b.bindings = append(b.bindings, uuidBinding{src: &v, dest: dest})
+	return &v
+}
+
+// parseAndBind парсит все зарегистрированные строки в uuid.UUID.
+func (b *uuidBinder) parseAndBind(entityName string) error {
+	for _, bind := range b.bindings {
+		id, err := uuid.Parse(*bind.src)
+		if err != nil {
+			return fmt.Errorf("parse %s id: %w", entityName, err)
+		}
+		*bind.dest = id
+	}
+	return nil
+}
+
+// scanRow — универсальный хелпер: сканирует строку, парсит UUID, оборачивает ошибки.
+// scanFn вызывает scanner.Scan самостоятельно и может делать пост-обработку
+// (например, конверсию string → TaskStatus).
+func scanRow[T any](
+	scanner rowScanner,
+	entityName string,
+	scanFn func(dest *T, b *uuidBinder) error,
+) (T, error) {
+	var entity T
+	b := &uuidBinder{}
+
+	err := scanFn(&entity, b)
 	if errors.Is(err, sql.ErrNoRows) {
-		return models.User{}, models.ErrNotFound
+		return entity, models.ErrNotFound
 	}
 	if err != nil {
-		return models.User{}, fmt.Errorf("scan user: %w", err)
+		return entity, fmt.Errorf("scan %s: %w", entityName, err)
 	}
-	u.ID, err = uuid.Parse(id)
-	if err != nil {
-		return models.User{}, fmt.Errorf("parse user id: %w", err)
+
+	if err := b.parseAndBind(entityName); err != nil {
+		return entity, err
 	}
-	return u, nil
+	return entity, nil
+}
+
+// scanRows — универсальный хелпер для цикла по sql.Rows.
+// Гарантированно закрывает rows при любом исходе (включая ошибку).
+func scanRows[T any](rows *sql.Rows, scanFn func(rowScanner) (T, error)) ([]T, error) {
+	defer rows.Close()
+
+	var items []T
+	for rows.Next() {
+		item, err := scanFn(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return items, nil
+}
+
+// --- Сканеры сущностей ---
+
+func scanUser(row rowScanner) (models.User, error) {
+	return scanRow(row, "user", func(u *models.User, b *uuidBinder) error {
+		return row.Scan(b.Register(&u.ID), &u.ExternalID, &u.Username, &u.CreatedAt)
+	})
 }
 
 func scanMeeting(row rowScanner) (models.Meeting, error) {
-	var m models.Meeting
-	var id, userID string
-	err := row.Scan(&id, &userID, &m.Title, &m.FilePath, &m.FileSize, &m.MimeType, &m.CreatedAt, &m.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return models.Meeting{}, models.ErrNotFound
-	}
-	if err != nil {
-		return models.Meeting{}, fmt.Errorf("scan meeting: %w", err)
-	}
-	m.ID, err = uuid.Parse(id)
-	if err != nil {
-		return models.Meeting{}, fmt.Errorf("parse meeting id: %w", err)
-	}
-	m.UserID, err = uuid.Parse(userID)
-	if err != nil {
-		return models.Meeting{}, fmt.Errorf("parse user id: %w", err)
-	}
-	return m, nil
+	return scanRow(row, "meeting", func(m *models.Meeting, b *uuidBinder) error {
+		return row.Scan(
+			b.Register(&m.ID), b.Register(&m.UserID),
+			&m.Title, &m.FilePath, &m.FileSize, &m.MimeType,
+			&m.CreatedAt, &m.UpdatedAt,
+		)
+	})
 }
 
 func scanTask(row rowScanner) (models.Task, error) {
-	var t models.Task
-	var id, meetingID, status string
-	err := row.Scan(&id, &meetingID, &status, &t.ErrorMessage, &t.RetryCount, &t.CreatedAt, &t.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return models.Task{}, models.ErrNotFound
-	}
-	if err != nil {
-		return models.Task{}, fmt.Errorf("scan task: %w", err)
-	}
-	t.ID, err = uuid.Parse(id)
-	if err != nil {
-		return models.Task{}, fmt.Errorf("parse task id: %w", err)
-	}
-	t.MeetingID, err = uuid.Parse(meetingID)
-	if err != nil {
-		return models.Task{}, fmt.Errorf("parse meeting id: %w", err)
-	}
-	t.Status = models.TaskStatus(status)
-	return t, nil
+	return scanRow(row, "task", func(t *models.Task, b *uuidBinder) error {
+		var status string
+		err := row.Scan(
+			b.Register(&t.ID), b.Register(&t.MeetingID),
+			&status, &t.ErrorMessage, &t.RetryCount,
+			&t.CreatedAt, &t.UpdatedAt,
+		)
+		if err != nil {
+			return err
+		}
+		t.Status = models.TaskStatus(status)
+		return nil
+	})
+}
+
+func scanTranscript(row rowScanner) (models.Transcript, error) {
+	return scanRow(row, "transcript", func(t *models.Transcript, b *uuidBinder) error {
+		return row.Scan(b.Register(&t.ID), b.Register(&t.MeetingID), &t.Text, &t.CreatedAt)
+	})
+}
+
+func scanSummary(row rowScanner) (models.Summary, error) {
+	return scanRow(row, "summary", func(s *models.Summary, b *uuidBinder) error {
+		return row.Scan(b.Register(&s.ID), b.Register(&s.MeetingID), &s.Text, &s.CreatedAt)
+	})
+}
+
+func scanSearchResult(row rowScanner) (models.SearchResult, error) {
+	return scanRow(row, "search result", func(r *models.SearchResult, b *uuidBinder) error {
+		var status string
+		err := row.Scan(b.Register(&r.MeetingID), &r.CreatedAt, &status, &r.Snippet)
+		if err != nil {
+			return err
+		}
+		r.Status = models.TaskStatus(status)
+		return nil
+	})
+}
+
+func scanChatMessage(row rowScanner) (models.ChatMessage, error) {
+	return scanRow(row, "chat message", func(m *models.ChatMessage, b *uuidBinder) error {
+		var role string
+		err := row.Scan(
+			b.Register(&m.ID), b.Register(&m.MeetingID), b.Register(&m.UserID),
+			&role, &m.Message, &m.CreatedAt,
+		)
+		if err != nil {
+			return err
+		}
+		m.Role = models.ChatRole(role)
+		return nil
+	})
+}
+
+func scanMeetingListItem(row rowScanner) (models.MeetingListItem, error) {
+	return scanRow(row, "meeting item", func(item *models.MeetingListItem, b *uuidBinder) error {
+		var status string
+		err := row.Scan(b.Register(&item.MeetingID), &item.Title, &item.CreatedAt, &status, &item.Summary)
+		if err != nil {
+			return err
+		}
+		item.Status = models.TaskStatus(status)
+		return nil
+	})
+}
+
+func scanMeetingInput(row rowScanner) (models.MeetingInput, error) {
+	return scanRow(row, "meeting input", func(in *models.MeetingInput, b *uuidBinder) error {
+		return row.Scan(b.Register(&in.MeetingID), &in.Type, &in.Text, &in.Audio, &in.MimeType)
+	})
 }

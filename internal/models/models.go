@@ -110,3 +110,12 @@ type MeetingListItem struct {
 	Status    TaskStatus
 	Summary   string
 }
+
+// MeetingInput — входные данные встречи, сохранённые при загрузке.
+type MeetingInput struct {
+	MeetingID uuid.UUID
+	Type      string // "audio" | "text"
+	Text      string
+	Audio     []byte
+	MimeType  string
+}

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Den8319/meetscribe/internal/repository/opt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -13,7 +14,7 @@ import (
 // newFastMock создаёт mock с почти нулевой задержкой для быстрых тестов.
 func newFastMock() *MockClient {
 	return NewMock(
-		WithDelay(time.Millisecond, time.Millisecond),
+		opt.WithDelay[MockClient](time.Millisecond, time.Millisecond),
 	)
 }
 
@@ -60,7 +61,7 @@ func TestChat_KeywordMatching(t *testing.T) {
 // метод возвращается быстро, не дожидаясь задержки (критерий Дня 3).
 func TestMock_ContextCancelled(t *testing.T) {
 	// Mock с большой задержкой — если ctx не уважается, тест зависнет.
-	m := NewMock(WithDelay(10*time.Second, 10*time.Second))
+	m := NewMock(opt.WithDelay[MockClient](10*time.Second, 10*time.Second))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // отменяем сразу
@@ -77,7 +78,7 @@ func TestMock_ContextCancelled(t *testing.T) {
 // TestMock_SummarizeRespectsContext проверяет, что при отмене посреди задержки
 // метод тоже прерывается.
 func TestMock_SummarizeRespectsContext(t *testing.T) {
-	m := NewMock(WithDelay(5*time.Second, 5*time.Second))
+	m := NewMock(opt.WithDelay[MockClient](5*time.Second, 5*time.Second))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()

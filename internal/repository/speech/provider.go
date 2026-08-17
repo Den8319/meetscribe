@@ -1,9 +1,8 @@
 package speech
 
 import (
-	"time"
-
 	"github.com/Den8319/meetscribe/internal/config"
+	"github.com/Den8319/meetscribe/internal/repository/opt"
 )
 
 // NewClient создаёт реализацию speech.Client по конфигурации.
@@ -12,22 +11,10 @@ import (
 func NewClient(cfg config.Config) Client {
 	switch cfg.SpeechProvider {
 	case "mock":
-		return NewMock(WithDelay(cfg.MockDelayMin, cfg.MockDelayMax))
+		return NewMock(opt.WithDelay[MockClient](cfg.MockDelayMin, cfg.MockDelayMax))
 	default:
 		// Неизвестный провайдер — безопасно падаем на mock,
 		// чтобы приложение продолжало работать в разработке.
-		return NewMock(WithDelay(cfg.MockDelayMin, cfg.MockDelayMax))
-	}
-}
-
-// Option — функциональная опция (generic option pattern, требование Go 1.26).
-// Конструкторы принимают opts ...Option[T] и применяют их к *T.
-type Option[T any] func(*T)
-
-// WithDelay задаёт диапазон задержки mock-клиента.
-func WithDelay(min, max time.Duration) Option[MockClient] {
-	return func(m *MockClient) {
-		m.delayMin = min
-		m.delayMax = max
+		return NewMock(opt.WithDelay[MockClient](cfg.MockDelayMin, cfg.MockDelayMax))
 	}
 }

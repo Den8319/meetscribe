@@ -13,11 +13,9 @@ import (
 )
 
 // Job — единица работы для воркера.
+// Содержит только ссылку на встречу
 type Job struct {
 	MeetingID uuid.UUID
-	Audio     []byte
-	MimeType  string
-	Text      string
 }
 
 // SpeechClient — контракт распознавания речи, необходимый воркеру.
@@ -38,8 +36,9 @@ type WorkerPool struct {
 	g     *errgroup.Group
 	ctx   context.Context // контекст воркеров (дочерний от shutdown)
 
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	active map[uuid.UUID]bool // встречи в обработке (для дедупликации)
+	closed bool               // очередь закрыта (shutdown) — Submit отклоняет задачи
 }
 
 // NewWorkerPool создаёт пул воркеров.
@@ -78,17 +77,32 @@ func (w *WorkerPool) Start(ctx context.Context) {
 	}
 
 	// Фоновый sweeper: раз в 10 секунд ищет зависшие задачи (created/processing)
-	// и отправляет их в очередь. Audio=nil → воркер пометит failed.
+	// и отправляет их в очередь. Входные данные воркер читает из БД,
+	// поэтому задача обрабатывается корректно даже после переполнения очереди.
 	go w.sweeper(ctx)
 }
 
 // Submit отправляет задачу в очередь. Неблокирующая: если очередь полна,
 // задача останется в БД со статусом created и будет подобрана sweeper'ом.
 func (w *WorkerPool) Submit(job Job) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		slog.Warn("submit on closed queue, task stays in db",
+			"meeting_id", job.MeetingID)
+		return false
+	}
+
+	// Пометка активной ДО отправки (дедупликация sweeper'а).
+	w.active[job.MeetingID] = true
+
 	select {
 	case w.queue <- job:
 		return true
 	default:
+		// Очередь полна — задача остаётся в БД, снимаем пометку,sweeper подберёт её позже.
+		delete(w.active, job.MeetingID)
 		slog.Warn("worker queue full, task will be picked up by sweeper",
 			"meeting_id", job.MeetingID)
 		return false
@@ -102,7 +116,7 @@ func (w *WorkerPool) Recover(ctx context.Context) error {
 		return err
 	}
 	for _, task := range tasks {
-		w.Submit(Job{MeetingID: task.MeetingID, Audio: nil})
+		w.Submit(Job{MeetingID: task.MeetingID})
 	}
 	slog.Info("recovery completed", "tasks", len(tasks))
 	return nil
@@ -114,8 +128,15 @@ func (w *WorkerPool) Wait() error {
 }
 
 // Stop инициирует graceful shutdown: закрывает очередь, ждёт воркеры.
+// Идемпотентен: повторный вызов безопасен.
 func (w *WorkerPool) Stop() {
-	close(w.queue)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.closed {
+		w.closed = true
+		close(w.queue)
+	}
 }
 
 // worker — цикл обработки одного воркера.
@@ -137,8 +158,8 @@ func (w *WorkerPool) worker(ctx context.Context, id int) error {
 }
 
 // processJob обрабатывает одну встречу: transcribe → save → summarize → save.
+// Встреча уже помечена активной в Submit — здесь только снимаем пометку.
 func (w *WorkerPool) processJob(ctx context.Context, job Job) {
-	w.markActive(job.MeetingID, true)
 	defer w.markActive(job.MeetingID, false)
 
 	task, err := w.storage.GetTaskByMeetingID(ctx, job.MeetingID)
@@ -158,12 +179,19 @@ func (w *WorkerPool) processJob(ctx context.Context, job Job) {
 	}
 
 	// 2. Получить транскрипцию
+	// Входные данные берём из БД — это гарантирует восстановление после рестарта.
+	input, err := w.storage.GetMeetingInput(ctx, job.MeetingID)
+	if err != nil {
+		w.failTask(ctx, task.ID, "get meeting input: "+err.Error())
+		return
+	}
+
 	var transcript string
 
 	switch {
-	case job.Text != "":
+	case input.Text != "":
 		// Текстовый ввод — речь не распознаём, текст и есть транскрипция.
-		transcript = job.Text
+		transcript = input.Text
 		if err := w.storage.SaveTranscript(ctx, job.MeetingID, transcript); err != nil {
 			w.failTask(ctx, task.ID, "save transcript: "+err.Error())
 			return
@@ -171,20 +199,15 @@ func (w *WorkerPool) processJob(ctx context.Context, job Job) {
 		slog.Info("worker: text meeting saved as transcript",
 			"meeting_id", job.MeetingID, "task_id", task.ID)
 
-	case job.Audio == nil:
-		// Аудио без данных (после рестарта байты утеряны).
-		w.failTask(ctx, task.ID, "audio data lost after restart")
-		return
-
-	default:
+	case len(input.Audio) > 0:
 		// Аудио: Transcribe с таймаутом speech.
 		speechCtx, speechCancel := context.WithTimeout(ctx, w.speechTimeout)
 		defer speechCancel()
 
 		slog.Info("speech transcribe requested",
 			"meeting_id", job.MeetingID, "task_id", task.ID,
-			"audio_size", len(job.Audio), "mime_type", job.MimeType)
-		transcript, err = w.speech.Transcribe(speechCtx, job.Audio, job.MimeType)
+			"audio_size", len(input.Audio), "mime_type", input.MimeType)
+		transcript, err = w.speech.Transcribe(speechCtx, input.Audio, input.MimeType)
 		if err != nil {
 			slog.Error("speech transcribe failed", "meeting_id", job.MeetingID, "task_id", task.ID, "error", err)
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -203,6 +226,11 @@ func (w *WorkerPool) processJob(ctx context.Context, job Job) {
 		slog.Info("transcript saved",
 			"meeting_id", job.MeetingID, "task_id", task.ID,
 			"transcript_len", len(transcript))
+
+	default:
+		// Нет ни текста, ни аудио — данные отсутствуют в БД.
+		w.failTask(ctx, task.ID, "meeting input data missing")
+		return
 	}
 
 	// 3. Summarize
@@ -262,7 +290,6 @@ func (w *WorkerPool) sweeper(ctx context.Context) {
 	}
 }
 
-
 func (w *WorkerPool) sweep(ctx context.Context) {
 	tasks, err := w.storage.GetTasksByStatus(ctx, models.StatusCreated, models.StatusProcessing)
 	if err != nil {
@@ -271,11 +298,12 @@ func (w *WorkerPool) sweep(ctx context.Context) {
 	}
 
 	for _, task := range tasks {
-		// Пропускаем задачи, которые уже обрабатываются воркером.
+		// Пропускаем задачи, которые уже в очереди или обрабатываются
+		// (пометка ставится в Submit до постановки в очередь).
 		if w.isActive(task.MeetingID) {
 			continue
 		}
-		w.Submit(Job{MeetingID: task.MeetingID, Audio: nil})
+		w.Submit(Job{MeetingID: task.MeetingID})
 	}
 }
 
@@ -291,7 +319,7 @@ func (w *WorkerPool) markActive(meetingID uuid.UUID, active bool) {
 }
 
 func (w *WorkerPool) isActive(meetingID uuid.UUID) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	return w.active[meetingID]
 }

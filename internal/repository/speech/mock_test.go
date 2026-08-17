@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Den8319/meetscribe/internal/repository/opt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -12,7 +13,7 @@ import (
 // newFastMock создаёт mock с почти нулевой задержкой для быстрых тестов.
 func newFastMock() *MockClient {
 	return NewMock(
-		WithDelay(time.Millisecond, time.Millisecond),
+		opt.WithDelay[MockClient](time.Millisecond, time.Millisecond),
 	)
 }
 
@@ -52,7 +53,7 @@ func TestTranscribe_ScenarioPool(t *testing.T) {
 
 // TestTranscribe_ContextCancelled проверяет, что отмена контекста прерывает задержку.
 func TestTranscribe_ContextCancelled(t *testing.T) {
-	m := NewMock(WithDelay(10*time.Second, 10*time.Second))
+	m := NewMock(opt.WithDelay[MockClient](10*time.Second, 10*time.Second))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -68,7 +69,7 @@ func TestTranscribe_ContextCancelled(t *testing.T) {
 
 // TestTranscribe_TimeoutMidDelay проверяет прерывание по таймауту контекста.
 func TestTranscribe_TimeoutMidDelay(t *testing.T) {
-	m := NewMock(WithDelay(5*time.Second, 5*time.Second))
+	m := NewMock(opt.WithDelay[MockClient](5*time.Second, 5*time.Second))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -79,4 +80,18 @@ func TestTranscribe_TimeoutMidDelay(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Less(t, elapsed, 2*time.Second, "must not wait full 5s delay")
+}
+
+// BenchmarkTranscribe измеряет пропускную способность mock Transcribe
+// с нулевой задержкой. b.Loop() (Go 1.24+) даёт стабильнее результаты,
+// чем ручной цикл for i := 0; i < b.N; i++ — рантайм сам управляет
+// количеством итераций и временем прогона.
+func BenchmarkTranscribe(b *testing.B) {
+	m := NewMock(opt.WithDelay[MockClient](0, 0))
+	ctx := context.Background()
+	audio := []byte("benchmark audio sample")
+
+	for b.Loop() {
+		_, _ = m.Transcribe(ctx, audio, "audio/ogg")
+	}
 }

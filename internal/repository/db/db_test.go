@@ -52,7 +52,7 @@ func setupTest(t *testing.T) *Repository {
 
 	// Очищаем данные между тестами.
 	_, err = sqlDB.ExecContext(ctx, `
-		TRUNCATE chat_messages, summaries, transcripts, task_events, tasks, meetings, users RESTART IDENTITY CASCADE`)
+		TRUNCATE chat_messages, summaries, transcripts, task_events, tasks, meeting_inputs, meetings, users RESTART IDENTITY CASCADE`)
 	require.NoError(t, err)
 
 	return New(sqlDB)
@@ -74,7 +74,7 @@ func TestCreateMeetingWithTask_Rollback(t *testing.T) {
 	ctx := context.Background()
 
 	// Несуществующий пользователь — FK constraint нарушится на INSERT meetings.
-	_, err := r.CreateMeetingWithTask(ctx, uuid.New(), "test", "telegram:1", 100, "audio/ogg")
+	_, err := r.CreateMeetingWithTask(ctx, uuid.New(), "test", "telegram:1", 100, "audio/ogg", "", []byte("audio"))
 	require.Error(t, err)
 
 	// Ничего не должно остаться: встреч, задач, событий — 0.
@@ -95,7 +95,7 @@ func TestCreateMeetingWithTask_Success(t *testing.T) {
 	ctx := context.Background()
 
 	user := createTestUser(t, r, 1001)
-	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "Планёрка", "telegram:42", 2048, "audio/ogg")
+	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "Планёрка", "telegram:42", 2048, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	assert.NotEqual(t, uuid.Nil, meeting.ID)
@@ -119,7 +119,7 @@ func TestUpdateTaskStatus_AddsEvent(t *testing.T) {
 	ctx := context.Background()
 
 	user := createTestUser(t, r, 1002)
-	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg")
+	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	task, err := r.GetTaskByMeetingID(ctx, meeting.ID)
@@ -149,9 +149,9 @@ func TestSearchMeetings_UserIsolation(t *testing.T) {
 	userA := createTestUser(t, r, 2001)
 	userB := createTestUser(t, r, 2002)
 
-	meetingA, err := r.CreateMeetingWithTask(ctx, userA.ID, "A", "telegram:1", 10, "audio/ogg")
+	meetingA, err := r.CreateMeetingWithTask(ctx, userA.ID, "A", "telegram:1", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
-	_, err = r.CreateMeetingWithTask(ctx, userB.ID, "B", "telegram:2", 10, "audio/ogg")
+	_, err = r.CreateMeetingWithTask(ctx, userB.ID, "B", "telegram:2", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	// Оба пользователя сохраняют одинаковый текст "секретный пароль".
@@ -182,7 +182,7 @@ func TestGetMeetingByID_Forbidden(t *testing.T) {
 	userA := createTestUser(t, r, 3001)
 	userB := createTestUser(t, r, 3002)
 
-	meeting, err := r.CreateMeetingWithTask(ctx, userA.ID, "A", "telegram:1", 10, "audio/ogg")
+	meeting, err := r.CreateMeetingWithTask(ctx, userA.ID, "A", "telegram:1", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	_, err = r.GetMeetingByID(ctx, userB.ID, meeting.ID)
@@ -195,7 +195,7 @@ func TestSaveError(t *testing.T) {
 	ctx := context.Background()
 
 	user := createTestUser(t, r, 4001)
-	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg")
+	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	task, err := r.GetTaskByMeetingID(ctx, meeting.ID)
@@ -218,9 +218,9 @@ func TestGetTasksByStatus(t *testing.T) {
 	user := createTestUser(t, r, 5001)
 
 	// Две встречи: одна остаётся created, вторая переводится в processing.
-	m1, err := r.CreateMeetingWithTask(ctx, user.ID, "1", "telegram:1", 10, "audio/ogg")
+	m1, err := r.CreateMeetingWithTask(ctx, user.ID, "1", "telegram:1", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
-	m2, err := r.CreateMeetingWithTask(ctx, user.ID, "2", "telegram:2", 10, "audio/ogg")
+	m2, err := r.CreateMeetingWithTask(ctx, user.ID, "2", "telegram:2", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	t1, err := r.GetTaskByMeetingID(ctx, m1.ID)
@@ -245,7 +245,7 @@ func TestSaveTranscript(t *testing.T) {
 	ctx := context.Background()
 
 	user := createTestUser(t, r, 6001)
-	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg")
+	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	err = r.SaveTranscript(ctx, meeting.ID, "текст транскрипции")
@@ -274,7 +274,7 @@ func TestSaveSummary(t *testing.T) {
 	ctx := context.Background()
 
 	user := createTestUser(t, r, 6002)
-	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg")
+	meeting, err := r.CreateMeetingWithTask(ctx, user.ID, "test", "telegram:1", 10, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	err = r.SaveSummary(ctx, meeting.ID, "краткая выжимка")

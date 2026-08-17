@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Den8319/meetscribe/internal/models"
@@ -25,6 +26,7 @@ type fakeStorage struct {
 	summaries   map[uuid.UUID]string
 	users       map[int64]models.User
 	chatHistory map[uuid.UUID][]models.ChatMessage
+	inputs      map[uuid.UUID]models.MeetingInput // входные данные встреч
 }
 
 func newFakeStorage() *fakeStorage {
@@ -35,16 +37,39 @@ func newFakeStorage() *fakeStorage {
 		summaries:   make(map[uuid.UUID]string),
 		users:       make(map[int64]models.User),
 		chatHistory: make(map[uuid.UUID][]models.ChatMessage),
+		inputs:      make(map[uuid.UUID]models.MeetingInput),
 	}
 }
 
-func (f *fakeStorage) CreateMeetingWithTask(ctx context.Context, userID uuid.UUID, title, filePath string, fileSize int64, mimeType string) (models.Meeting, error) {
+func (f *fakeStorage) CreateMeetingWithTask(ctx context.Context, userID uuid.UUID, title, filePath string, fileSize int64, mimeType, text string, audio []byte) (models.Meeting, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	m := models.Meeting{ID: uuid.New(), UserID: userID, Title: title}
+	m := models.Meeting{ID: uuid.New(), UserID: userID, Title: title, MimeType: mimeType, FileSize: fileSize}
 	f.meetings[m.ID] = m
 	f.tasks[m.ID] = models.Task{ID: uuid.New(), MeetingID: m.ID, Status: models.StatusCreated}
+
+	inputType := "audio"
+	if text != "" {
+		inputType = "text"
+	}
+	f.inputs[m.ID] = models.MeetingInput{
+		MeetingID: m.ID,
+		Type:      inputType,
+		Text:      text,
+		Audio:     audio,
+		MimeType:  mimeType,
+	}
 	return m, nil
+}
+
+func (f *fakeStorage) GetMeetingInput(ctx context.Context, meetingID uuid.UUID) (models.MeetingInput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	in, ok := f.inputs[meetingID]
+	if !ok {
+		return models.MeetingInput{}, models.ErrNotFound
+	}
+	return in, nil
 }
 
 func (f *fakeStorage) GetMeetingByID(ctx context.Context, userID, meetingID uuid.UUID) (models.Meeting, error) {
@@ -334,31 +359,30 @@ func TestWorkerPool_ConcurrencyLimit(t *testing.T) {
 	// Создаём 10 встреч (задач).
 	meetings := make([]uuid.UUID, 0, 10)
 	for range 10 {
-		m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "test", "", 100, "audio/ogg")
+		m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "test", "", 100, "audio/ogg", "", []byte("audio"))
 		require.NoError(t, err)
 		meetings = append(meetings, m.ID)
 	}
 
-	wp := NewWorkerPool(storage, sp, llm, 2, 10*time.Second, 10*time.Second, 10)
-	ctx := t.Context()
-	wp.Start(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp := NewWorkerPool(storage, sp, llm, 2, 10*time.Second, 10*time.Second, 10)
+		wp.Start(ctx)
 
-	// Отправляем 10 задач в очередь.
-	for _, id := range meetings {
-		require.True(t, wp.Submit(Job{MeetingID: id, Audio: []byte("audio"), MimeType: "audio/ogg"}))
-	}
-
-	// Ждём завершения всех с таймаутом.
-	require.Eventually(t, func() bool {
-		storage.mu.Lock()
-		defer storage.mu.Unlock()
+		// Отправляем 10 задач в очередь — только ссылка, аудио в БД.
 		for _, id := range meetings {
-			if storage.tasks[id].Status != models.StatusCompleted {
-				return false
-			}
+			require.True(t, wp.Submit(Job{MeetingID: id}))
 		}
-		return true
-	}, 5*time.Second, 50*time.Millisecond, "all tasks must complete")
+
+		// time.Sleep продвигает виртуальное время: воркеры обрабатывают задачи.
+		// 10 задач × 100мс (speech+LLM) / 2 воркера = 500мс; спим 2с с запасом.
+		time.Sleep(2 * time.Second)
+
+		// Останавливаем пул.
+		cancel()
+		wp.Stop()
+		_ = wp.Wait()
+	})
 
 	// Лимит параллелизма: не более 2 одновременных speech-вызовов.
 	assert.LessOrEqual(t, sp.maxSeen, 2, "max concurrent speech calls must be <= 2")
@@ -366,6 +390,9 @@ func TestWorkerPool_ConcurrencyLimit(t *testing.T) {
 	// Все транскрипции и выжимки сохранены.
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
+	for _, id := range meetings {
+		assert.Equal(t, models.StatusCompleted, storage.tasks[id].Status, "task must complete")
+	}
 	assert.Len(t, storage.transcripts, 10)
 	assert.Len(t, storage.summaries, 10)
 }
@@ -376,23 +403,26 @@ func TestWorkerPool_TextInput(t *testing.T) {
 	sp := &fakeSpeech{delay: 10 * time.Millisecond}
 	llm := &fakeLLM{delay: 10 * time.Millisecond}
 
-	m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "текстовая встреча", "", 0, "")
+	m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "текстовая встреча", "", 0, "", "Иван: привет. Пятница — дедлайн.", nil)
 	require.NoError(t, err)
 
-	wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
-	ctx := t.Context()
-	wp.Start(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
 
-	require.True(t, wp.Submit(Job{MeetingID: m.ID, Text: "Иван: привет. Пятница — дедлайн."}))
+		require.True(t, wp.Submit(Job{MeetingID: m.ID}))
 
-	require.Eventually(t, func() bool {
-		storage.mu.Lock()
-		defer storage.mu.Unlock()
-		return storage.tasks[m.ID].Status == models.StatusCompleted
-	}, 3*time.Second, 50*time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
+
+		cancel()
+		wp.Stop()
+		_ = wp.Wait()
+	})
 
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
+	assert.Equal(t, models.StatusCompleted, storage.tasks[m.ID].Status)
 	assert.Equal(t, "Иван: привет. Пятница — дедлайн.", storage.transcripts[m.ID])
 	assert.Equal(t, "краткая выжимка", storage.summaries[m.ID])
 	assert.Zero(t, sp.maxSeen, "speech must not be called for text input")
@@ -404,51 +434,59 @@ func TestWorkerPool_SpeechFailure(t *testing.T) {
 	sp := &fakeSpeech{delay: 10 * time.Millisecond, fail: true}
 	llm := &fakeLLM{delay: 10 * time.Millisecond}
 
-	m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "test", "", 100, "audio/ogg")
+	m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "test", "", 100, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
-	wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
-	ctx := t.Context()
-	wp.Start(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
 
-	require.True(t, wp.Submit(Job{MeetingID: m.ID, Audio: []byte("audio"), MimeType: "audio/ogg"}))
+		require.True(t, wp.Submit(Job{MeetingID: m.ID}))
 
-	require.Eventually(t, func() bool {
-		storage.mu.Lock()
-		defer storage.mu.Unlock()
-		return storage.tasks[m.ID].Status == models.StatusFailed
-	}, 3*time.Second, 50*time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
+
+		cancel()
+		wp.Stop()
+		_ = wp.Wait()
+	})
 
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
+	assert.Equal(t, models.StatusFailed, storage.tasks[m.ID].Status)
 	assert.Contains(t, storage.tasks[m.ID].ErrorMessage, "speech provider error")
 }
 
-// TestWorkerPool_AudioLostAfterRestart — Job с nil audio → failed.
-func TestWorkerPool_AudioLostAfterRestart(t *testing.T) {
+// TestWorkerPool_AudioRestoredFromDB — после рестарта аудио берётся из БД,
+// задача успешно обрабатывается (раньше audio=nil → failed).
+func TestWorkerPool_AudioRestoredFromDB(t *testing.T) {
 	storage := newFakeStorage()
 	sp := &fakeSpeech{delay: 10 * time.Millisecond}
 	llm := &fakeLLM{delay: 10 * time.Millisecond}
 
-	m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "test", "", 100, "audio/ogg")
+	m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "test", "", 100, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
-	wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
-	ctx := t.Context()
-	wp.Start(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
 
-	// Восстановление после рестарта: audio=nil.
-	require.True(t, wp.Submit(Job{MeetingID: m.ID, Audio: nil}))
+		// Имитация восстановления: в очереди только MeetingID, без аудио.
+		// Воркер читает аудио из БД → задача завершается успешно.
+		require.True(t, wp.Submit(Job{MeetingID: m.ID}))
 
-	require.Eventually(t, func() bool {
-		storage.mu.Lock()
-		defer storage.mu.Unlock()
-		return storage.tasks[m.ID].Status == models.StatusFailed
-	}, 3*time.Second, 50*time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
+
+		cancel()
+		wp.Stop()
+		_ = wp.Wait()
+	})
 
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	assert.Contains(t, storage.tasks[m.ID].ErrorMessage, "audio data lost")
+	assert.Equal(t, models.StatusCompleted, storage.tasks[m.ID].Status, "task must complete — audio restored from db")
+	assert.Equal(t, "краткая выжимка", storage.summaries[m.ID])
 }
 
 // TestWorkerPool_ContextCancellation — отмена контекста останавливает воркеры.
@@ -457,28 +495,22 @@ func TestWorkerPool_ContextCancellation(t *testing.T) {
 	sp := &fakeSpeech{delay: 100 * time.Millisecond}
 	llm := &fakeLLM{delay: 100 * time.Millisecond}
 
-	wp := NewWorkerPool(storage, sp, llm, 2, 10*time.Second, 10*time.Second, 4)
-	ctx, cancel := context.WithCancel(context.Background())
-	wp.Start(ctx)
+	var wp *WorkerPool
 
-	// Даём воркерам стартовать.
-	time.Sleep(50 * time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp = NewWorkerPool(storage, sp, llm, 2, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
 
-	done := make(chan struct{})
-	go func() {
+		// Отменяем контекст → воркеры должны остановиться.
+		cancel()
+		// Wait ждёт, пока все горутины durably blocked (воркеры вышли по ctx.Done).
+		synctest.Wait()
 		_ = wp.Wait()
-		close(done)
-	}()
+	})
 
-	// Отменяем контекст → воркеры должны остановиться.
-	cancel()
-
-	select {
-	case <-done:
-		// воркеры завершились
-	case <-time.After(3 * time.Second):
-		t.Fatal("workers did not stop after context cancellation")
-	}
+	// synctest.Test вернулся — все горутины вышли, wp.Wait() уже завершён.
+	_ = wp
 }
 
 // TestWorkerPool_StopClosesQueue — Stop закрывает очередь, Wait возвращается.
@@ -487,23 +519,22 @@ func TestWorkerPool_StopClosesQueue(t *testing.T) {
 	sp := &fakeSpeech{delay: 10 * time.Millisecond}
 	llm := &fakeLLM{delay: 10 * time.Millisecond}
 
-	wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
-	ctx := t.Context()
-	wp.Start(ctx)
+	var wp *WorkerPool
 
-	wp.Stop()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	done := make(chan struct{})
-	go func() {
+		wp = NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
+		wp.Stop() // закрываем очередь
+
+		// Wait ждёт, пока воркеры выйдут по закрытому каналу.
+		synctest.Wait()
 		_ = wp.Wait()
-		close(done)
-	}()
+	})
 
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Wait did not return after Stop")
-	}
+	_ = wp // synctest.Test вернулся — все горутины вышли
 }
 
 // TestWorkerPool_Recover — Recover находит незавершённые задачи.
@@ -512,10 +543,10 @@ func TestWorkerPool_Recover(t *testing.T) {
 	sp := &fakeSpeech{delay: 10 * time.Millisecond}
 	llm := &fakeLLM{delay: 10 * time.Millisecond}
 
-	// Две задачи: одна created, одна completed.
-	m1, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "1", "", 100, "audio/ogg")
+	// Две задачи: одна created (с аудио в БД), одна completed.
+	m1, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "1", "", 100, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
-	m2, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "2", "", 100, "audio/ogg")
+	m2, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "2", "", 100, "audio/ogg", "", []byte("audio"))
 	require.NoError(t, err)
 
 	storage.mu.Lock()
@@ -523,16 +554,71 @@ func TestWorkerPool_Recover(t *testing.T) {
 	storage.tasks[m2.ID] = models.Task{ID: storage.tasks[m2.ID].ID, MeetingID: m2.ID, Status: models.StatusCompleted}
 	storage.mu.Unlock()
 
-	wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
-	ctx := t.Context()
-	wp.Start(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
 
-	require.NoError(t, wp.Recover(ctx))
+		require.NoError(t, wp.Recover(ctx))
 
-	// created-задача → в очереди → станет failed (audio=nil).
-	require.Eventually(t, func() bool {
-		storage.mu.Lock()
-		defer storage.mu.Unlock()
-		return storage.tasks[m1.ID].Status == models.StatusFailed
-	}, 3*time.Second, 50*time.Millisecond)
+		// created-задача → в очереди → аудио из БД → completed.
+		time.Sleep(500 * time.Millisecond)
+
+		cancel()
+		wp.Stop()
+		_ = wp.Wait()
+	})
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	assert.Equal(t, models.StatusCompleted, storage.tasks[m1.ID].Status, "created task must be recovered and completed")
+	assert.Equal(t, models.StatusCompleted, storage.tasks[m2.ID].Status, "completed task must not be re-processed")
+}
+
+// TestWorkerPool_SubmitAfterStop — Submit после Stop не паникует
+// (защита от send on closed channel при гонке shutdown ↔ Telegram-хендлер).
+func TestWorkerPool_SubmitAfterStop(t *testing.T) {
+	storage := newFakeStorage()
+	sp := &fakeSpeech{delay: 10 * time.Millisecond}
+	llm := &fakeLLM{delay: 10 * time.Millisecond}
+
+	m, err := storage.CreateMeetingWithTask(context.Background(), uuid.New(), "test", "", 100, "audio/ogg", "", []byte("audio"))
+	require.NoError(t, err)
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
+
+		// Останавливаем пул — очередь закрыта.
+		wp.Stop()
+		cancel()
+
+		// Submit после Stop: должен вернуть false, не паникуя.
+		require.False(t, wp.Submit(Job{MeetingID: m.ID}))
+
+		// Повторный Stop безопасен (идемпотентен).
+		wp.Stop()
+
+		_ = wp.Wait()
+	})
+}
+
+// TestWorkerPool_StopIdempotent — двойной Stop не паникует (close of closed channel).
+func TestWorkerPool_StopIdempotent(t *testing.T) {
+	storage := newFakeStorage()
+	sp := &fakeSpeech{delay: 10 * time.Millisecond}
+	llm := &fakeLLM{delay: 10 * time.Millisecond}
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		wp := NewWorkerPool(storage, sp, llm, 1, 10*time.Second, 10*time.Second, 4)
+		wp.Start(ctx)
+
+		wp.Stop()
+		wp.Stop() // второй раз — не паникует
+		cancel()
+
+		_ = wp.Wait()
+	})
 }

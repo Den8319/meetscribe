@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Den8319/meetscribe/internal/models"
+	"github.com/Den8319/meetscribe/internal/repository/opt"
 )
 
 // MockClient — тестовая реализация llm.Client.
@@ -18,15 +19,22 @@ type MockClient struct {
 }
 
 // NewMock создаёт mock-клиент (generic option pattern).
-func NewMock(opts ...Option[MockClient]) *MockClient {
+// По умолчанию задержка 2-5 секунд; настраивается опцией opt.WithDelay.
+func NewMock(opts ...opt.Option[MockClient]) *MockClient {
 	m := &MockClient{
 		delayMin: 2 * time.Second,
 		delayMax: 5 * time.Second,
 	}
-	for _, opt := range opts {
-		opt(m)
+	for _, o := range opts {
+		o(m)
 	}
 	return m
+}
+
+// SetDelay реализует opt.Delayer.
+func (m *MockClient) SetDelay(min, max time.Duration) {
+	m.delayMin = min
+	m.delayMax = max
 }
 
 // Summarize генерирует выжимку встречи по тексту транскрипции.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -13,6 +14,11 @@ import (
 	"github.com/google/uuid"
 	tele "gopkg.in/telebot.v3"
 )
+
+// logErr логирует ошибку с контекстом операции.
+func logErr(op string, err error) {
+	slog.Error("telegram handler error", "op", op, "error", err)
+}
 
 func (b *Bot) OnStart(c tele.Context) error {
 	return c.Send("MeetScribe — meeting notes assistant.\n\n" +
@@ -29,7 +35,8 @@ func (b *Bot) OnList(c tele.Context) error {
 	user := c.Get("user").(models.User)
 	meetings, err := b.svc.ListMeetings(context.Background(), user.ID)
 	if err != nil {
-		return c.Send("Error: " + err.Error())
+		logErr("list meetings", err)
+		return c.Send("Failed to load meetings. Please try again later.")
 	}
 	if len(meetings) == 0 {
 		return c.Send("No meetings found!")
@@ -38,8 +45,8 @@ func (b *Bot) OnList(c tele.Context) error {
 	sb := new(strings.Builder)
 	for _, m := range meetings {
 		fmt.Fprintf(sb, "• %s | %s | %s\n", m.MeetingID, m.CreatedAt.Format(time.RFC3339), m.Status)
-		if m.Summary != "" {			
-			summary := m.Summary			
+		if m.Summary != "" {
+			summary := m.Summary
 			fmt.Fprintf(sb, "   %s\n", summary)
 		}
 	}
@@ -131,30 +138,32 @@ func (b *Bot) OnVoice(c tele.Context) error {
 	// Скачиваем файл (telebot сам делает getFile + download)
 	file, err := b.tb.FileByID(msg.Voice.FileID)
 	if err != nil {
-		return c.Send("File not found: " + err.Error())
+		logErr("voice fileByID", err)
+		return c.Send("Failed to download voice. Please try again.")
 	}
 	reader, err := b.tb.File(&file)
 	if err != nil {
-		return c.Send("Error downloading file: " + err.Error())
+		logErr("voice download", err)
+		return c.Send("Failed to download voice. Please try again.")
 	}
 	defer reader.Close()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return c.Send("Error reading file")
+		logErr("voice read", err)
+		return c.Send("Failed to read voice data. Please try again.")
 	}
 
-	// Создаём встречу + задачу в БД
+	// Создаём встречу + задачу в БД (аудио сохраняется в БД, воркер читает оттуда)
 	meeting, err := b.svc.UploadAndStartProcessing(context.Background(), user.ID, "Voice", data, "audio/ogg", "")
 	if err != nil {
-		return c.Send("Failed to create meeting: " + err.Error())
+		logErr("voice create meeting", err)
+		return c.Send("Failed to create meeting. Please try again later.")
 	}
 
-	// Передаём аудио воркеру напрямую (sweeper шлёт nil!)
+	// В очередь — только ссылку на встречу.
 	b.wp.Submit(service.Job{
 		MeetingID: meeting.ID,
-		Audio:     data,
-		MimeType:  "audio/ogg",
 	})
 
 	return c.Send(fmt.Sprintf("Voice downloaded! Meeting %s processing.", meeting.ID))
@@ -181,31 +190,33 @@ func (b *Bot) OnAudio(c tele.Context) error {
 	// Скачиваем файл
 	file, err := b.tb.FileByID(msg.Audio.FileID)
 	if err != nil {
-		return c.Send("File not found: " + err.Error())
+		logErr("audio fileByID", err)
+		return c.Send("Failed to download audio. Please try again.")
 	}
 	reader, err := b.tb.File(&file)
 	if err != nil {
-		return c.Send("Error downloading file: " + err.Error())
+		logErr("audio download", err)
+		return c.Send("Failed to download audio. Please try again.")
 	}
 	defer reader.Close()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return c.Send("Error reading file")
+		logErr("audio read", err)
+		return c.Send("Failed to read audio data. Please try again.")
 	}
 
-	// Создаём встречу + задачу
+	// Создаём встречу + задачу (аудио сохраняется в БД, воркер читает оттуда)
 	meeting, err := b.svc.UploadAndStartProcessing(
 		context.Background(), user.ID, "Audio file", data, mimeType, "")
 	if err != nil {
-		return c.Send("Failed to create meeting: " + err.Error())
+		logErr("audio create meeting", err)
+		return c.Send("Failed to create meeting. Please try again later.")
 	}
 
-	// Передаём аудио воркеру
+	// В очередь — только ссылку на встречу.
 	b.wp.Submit(service.Job{
 		MeetingID: meeting.ID,
-		Audio:     data,
-		MimeType:  mimeType,
 	})
 
 	return c.Send(fmt.Sprintf("Audio received! Meeting %s is processing.", meeting.ID))
@@ -228,30 +239,36 @@ func (b *Bot) OnDocument(c tele.Context) error {
 	// Скачиваем файл
 	file, err := b.tb.FileByID(doc.FileID)
 	if err != nil {
-		return c.Send("File not found: " + err.Error())
+		logErr("document fileByID", err)
+		return c.Send("Failed to download file. Please try again.")
 	}
 	reader, err := b.tb.File(&file)
 	if err != nil {
-		return c.Send("Error downloading file: " + err.Error())
+		logErr("document download", err)
+		return c.Send("Failed to download file. Please try again.")
 	}
 	defer reader.Close()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return c.Send("Error reading file")
+		logErr("document read", err)
+		return c.Send("Failed to read file data. Please try again.")
 	}
 
-	// Создаём встречу с текстовым вводом (audio=nil, text=содержимое)
+
+
+
+	// Создаём встречу с текстовым вводом (текст сохраняется в БД, воркер читает оттуда)
 	meeting, err := b.svc.UploadAndStartProcessing(
 		context.Background(), user.ID, doc.FileName, nil, "", string(data))
 	if err != nil {
-		return c.Send("Failed to create meeting: " + err.Error())
+		logErr("document create meeting", err)
+		return c.Send("Failed to create meeting. Please try again later.")
 	}
 
-	// Воркеру — Job с Text (speech не вызывается)
+	// В очередь — только ссылку на встречу.
 	b.wp.Submit(service.Job{
 		MeetingID: meeting.ID,
-		Text:      string(data),
 	})
 
 	return c.Send(fmt.Sprintf("Text file received! Meeting %s is processing.", meeting.ID))
@@ -302,7 +319,8 @@ func (b *Bot) OnText(c tele.Context) error {
 	}
 	answer, err := b.svc.AskQuestion(context.Background(), user.ID, meetingID, c.Text())
 	if err != nil {
-		return c.Send("Error: " + err.Error())
+		logErr("ask question", err)
+		return c.Send("Failed to process your question. Please try again later.")
 	}
 	return c.Send(answer)
 }
