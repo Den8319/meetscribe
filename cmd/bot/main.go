@@ -101,14 +101,11 @@ func run() error {
 	// 1. Останавливаем бота (перестаёт принимать новые сообщения).
 	tgBot.Stop()
 
-	// 2. Отменяем корневой контекст → воркеры получают отмену,
-	//    внешние запросы (speech/LLM) прерываются.
-	cancelRoot()
-
-	// 2. Закрываем очередь → воркеры дообрабатывают остаток и выходят.
+	// 2. Закрываем очередь → воркеры дочитывают остаток и выходят
+	//    по закрытому каналу (case job, ok := <-queue; !ok).
 	wp.Stop()
 
-	// 3. Ждём воркеры с таймаутом (errgroup).
+	// 3. Ждём воркеры с таймаутом.
 	done := make(chan error, 1)
 	go func() {
 		done <- wp.Wait()
@@ -124,6 +121,8 @@ func run() error {
 		}
 		slog.Info("all workers stopped")
 	case <-shutdownCtx.Done():
+		// 4. Таймаут — отменяем контекст, прерываем зависшие speech/LLM запросы.
+		cancelRoot()
 		slog.Warn("shutdown timeout exceeded, forcing stop",
 			"timeout", cfg.ShutdownTimeout)
 	}

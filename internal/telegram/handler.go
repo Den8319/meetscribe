@@ -91,14 +91,16 @@ func (b *Bot) OnGet(c tele.Context) error {
 		return c.Send("Meeting not found or transcript not ready")
 	}
 
-	text := tr.Text
-	for len(text) > 4000 {
-		if err := c.Send(text[:4000]); err != nil {
+	// Нарезаем по рунам, а не по байтам: text[:4000] мог разрезать
+	// многобайтный UTF-8 символ (кириллица — 2 байта) и испортить текст.
+	runes := []rune(tr.Text)
+	for len(runes) > 4000 {
+		if err := c.Send(string(runes[:4000])); err != nil {
 			return err
 		}
-		text = text[4000:]
+		runes = runes[4000:]
 	}
-	return c.Send(text)
+	return c.Send(string(runes))
 }
 
 func (b *Bot) OnFind(c tele.Context) error {
@@ -254,9 +256,6 @@ func (b *Bot) OnDocument(c tele.Context) error {
 		logErr("document read", err)
 		return c.Send("Failed to read file data. Please try again.")
 	}
-
-
-
 
 	// Создаём встречу с текстовым вводом (текст сохраняется в БД, воркер читает оттуда)
 	meeting, err := b.svc.UploadAndStartProcessing(
